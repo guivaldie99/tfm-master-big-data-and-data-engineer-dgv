@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploys the Lambda that writes transformed records into an Iceberg table.
+
+Parameters:
+  Project:
+    Type: String
+    Description: Name of the project for the Tag
+    Default: "mbdde"
+  Environment:
+    Type: String
+    Description: Name of the environment for the Tag
+    Default: "dev"
+    AllowedValues:
+      - "dev"
+      - "pre"
+      - "qa"
+      - "stg"
+      - "demo"
+      - "ocu"
+      - "prod"
+  Student:
+    Description: Student owner
+    Type: String
+    Default: "dgv"
+    AllowedValues:
+      - "dgv"
+  Prefix:
+    Type: String
+    Default: "tfm"
+    Description: Platform id prefix
+    AllowedValues:
+      - "tfm"
+  CodeVersion:
+    Type: String
+    Default: "0.0.1"
+    Description: Version of the writer code
+
+Resources:
+  ToIcebergLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-to-iceberg-lambdaRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: IcebergWritePermissions
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # Glue Catalog metadata reads/writes
+              - Effect: Allow
+                Action:
+                  - glue:GetTable
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:GetDatabase
+                  - glue:GetPartition
+                  - glue:BatchCreatePartition
+                  - glue:BatchDeletePartition
+                  - glue:BatchGetPartition
+                  - glue:GetTableVersion
+                  - glue:CreatePartition
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/*
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/*/*
+                # icebergs manifest & metadata use the same glue catalog ARN
+              # S3 read/write for data files
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:AbortMultipartUpload
+                  - s3:ListMultipartUploadParts
+                  - s3:ListBucket
+                  - s3:PutObject
+                  - s3:GetObject
+                  - s3:DeleteObject
+                Resource: 
+                  - Fn::ImportValue: !Sub "${Project}-${Environment}-datalake-bucket-arn"
+                  - !Join 
+                    - ''
+                    - - Fn::ImportValue: !Sub "${Project}-${Environment}-datalake-bucket-arn"
+                      - "/*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              # Athena (ejecutar DDL y consultar estado)
+              - Effect: Allow
+                Action:
+                  - athena:StartQueryExecution
+                  - athena:GetQueryExecution
+                  - athena:GetWorkGroup
+                  - athena:ListWorkGroups
+                Resource: "*"
+              # S3 - resultados de Athena
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:GetBucketLocation
+                  - s3:ListBucket
+                Resource:
+                  - Fn::ImportValue: !Sub "${Project}-${Environment}-athena-bucket-arn"
+                  - !Join 
+                    - ''
+                    - - Fn::ImportValue: !Sub "${Project}-${Environment}-athena-bucket-arn"
+                      - "/*"
+
+  ToIcebergLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub dl-${Prefix}-${Student}-${Project}-${Environment}-to-iceberg-lambda
+      Handler: writer.lambda_handler
+      Runtime: python3.11
+      Role: !GetAtt ToIcebergLambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Sub 'config-${Prefix}-${Student}-${Project}-bucket'
+        S3Key: !Sub "to-iceberg-lambda/to-iceberg-lambda-${CodeVersion}.zip"
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          ICEBERG_CATALOG_NAME: !Ref AWS::AccountId
+          ICEBERG_WAREHOUSE_PATH: !Sub 's3://dl-${Prefix}-${Student}-${Project}-${Environment}-athena-query-results-bucket/data/'
+          ICEBERG_DB_NAME: !Sub ${Prefix}_${Student}_${Project}_meteorology_live
+          ICEBERG_TABLE_NAME: 'meteorology'
+          AWS_ACCOUNT_ID: !Ref AWS::AccountId
+          AWS_REGION_ID: !Ref AWS::Region
+          DATALAKE_BUCKET: !Sub dl-${Prefix}-${Student}-${Project}-${Environment}-athena-query-results-bucket
+          ATHENA_WORKGROUP: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-athena-query-results-bucket'
+          ATHENA_OUTPUT_S3: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-athena-query-results-bucket/Meteorology/'
+
+Outputs:
+  ToIcebergFunctionArn:
+    Description: ARN of the Iceberg writer Lambda
+    Value: !GetAtt ToIcebergLambdaFunction.Arn
+    Export:
+      Name: !Sub "${Project}-${Environment}-to-iceberg-lambda-arn"
