@@ -6,13 +6,6 @@ Este repositorio contiene **infraestructura como código** (CloudFormation) y **
 
 ## 1) Arquitectura
 
-```mermaid
-flowchart LR
-  %% ====== Estilo opcional ======
-  classDef storage fill:#f3f7ff,stroke:#5b8def,stroke-width:1px,color:#0b2b64;
-  classDef compute fill:#f9f9f9,stroke:#888,stroke-width:1px,color:#222;
-  classDef service fill:#fef6e4,stroke:#d09a00,stroke-width:1px,color:#3a2a00;
-  classDef catalog fill:#eefbea,stroke:#3aa655,stroke-width:1px,color:#1d4d2a;
 
   %% ====== Fuentes ======
   subgraph F[Fuentes]
