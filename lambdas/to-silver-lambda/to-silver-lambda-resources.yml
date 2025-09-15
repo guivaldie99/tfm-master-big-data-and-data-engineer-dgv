@@ -1,0 +1,165 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Lambda that execute jupyter notebook on EMR.
+
+Parameters:
+  Project:
+    Type: String
+    Description: Name of the project for the Tag
+    Default: "mbdde"
+  Environment:
+    Type: String
+    Description: Name of the environment for the Tag
+    Default: "prod"
+    AllowedValues:
+      - "dev"
+      - "pre"
+      - "qa"
+      - "stg"
+      - "demo"
+      - "ocu"
+      - "prod"
+  Student:
+    Description: Student owner
+    Type: String
+    Default: "dgv"
+    AllowedValues:
+      - "dgv"
+  Prefix:
+    Type: String
+    Default: "tfm"
+    Description: Platform id prefix
+    AllowedValues:
+      - "tfm"
+  CodeVersion:
+    Type: String
+    Default: "0.0.1"
+    Description: Version of the transformation code
+  Domain:
+    Type: String
+    Description: data to process
+    AllowedValues:
+      - meteorology
+      - arrivals
+      - lines
+  EmrAppId:
+    Type: String
+    Description: ID del entorno serverless asociado al workspace
+    Default: 00fv4tbtp4i4a70p
+  JobScriptS3:
+    Type: String
+    Description: job emr serverless
+    AllowedValues:
+      - s3://dl-tfm-dgv-mbdde-dev-emr-bucket/mbdde/e-98K87HLK7LR0EYQE4Z1WXX8Z2/meteorology.py
+      - s3://dl-tfm-dgv-mbdde-dev-emr-bucket/mbdde/e-98K87HLK7LR0EYQE4Z1WXX8Z2/emt-arrival.py
+      - s3://dl-tfm-dgv-mbdde-dev-emr-bucket/mbdde/e-98K87HLK7LR0EYQE4Z1WXX8Z2/emt-lines.py
+  DatabaseName: 
+    Type: String
+    Description: Database name
+    AllowedValues:
+      - tfm_dgv_mbdde_emt_silver
+      - tfm_dgv_mbdde_meteorology_silver
+
+Resources:
+
+  ExecuteEmrNotebookLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub dl-${Prefix}-${Student}-${Project}-${Environment}-execute-${Domain}-emr-notebook-lambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowInvokeWriter
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-bucket-arn
+                  - !Join
+                    - ''
+                    - 
+                      - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-bucket-arn
+                      - '/*'
+                  - arn:aws:s3:::dl-tfm-dgv-mbdde-dev-emr-bucket
+                  - arn:aws:s3:::dl-tfm-dgv-mbdde-dev-emr-bucket/*
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource:
+                  - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-kms-key-arn
+                  - Fn::ImportValue: !Sub ${Project}-${Environment}-emr-kms-key-arn
+              - Effect: Allow
+                Action:
+                  - elasticmapreduce:StartNotebookExecution
+                  - elasticmapreduce:DescribeEditor
+                  - elasticmapreduce:ListEditors
+                Resource: 
+                  - !Sub arn:aws:elasticmapreduce:${AWS::Region}:${AWS::AccountId}:editor/*
+                  - !Sub arn:aws:elasticmapreduce:${AWS::Region}:${AWS::AccountId}:notebook-execution/*
+                  - !Sub arn:aws:elasticmapreduce:${AWS::Region}:${AWS::AccountId}:cluster/*
+              - Effect: Allow
+                Action:
+                  - emr-serverless:StartApplication
+                  - emr-serverless:GetApplication
+                  - emr-serverless:ListApplications
+                  - emr-serverless:StartJobRun
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: 
+                  - !Sub 'arn:aws:iam::${AWS::AccountId}:role/dl-${Prefix}-${Student}-${Project}-${Environment}-emr-serverless-role'
+
+  ExecuteEmrNotebookLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub dl-${Prefix}-${Student}-${Project}-${Environment}-execute-${Domain}-emr-notebook-lambda
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Role: !GetAtt ExecuteEmrNotebookLambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Sub 'config-${Prefix}-${Student}-${Project}-bucket'
+        S3Key: !Sub "execute-emr-notebook-lambda/execute-emr-notebook-lambda-${CodeVersion}.zip"
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          JOB_SCRIPT_S3: !Ref JobScriptS3 
+          EMR_APP_ID: !Ref EmrAppId  
+          EMR_RUNTIME_ROLE_ARN: !Sub 'arn:aws:iam::${AWS::AccountId}:role/dl-${Prefix}-${Student}-${Project}-${Environment}-emr-serverless-role' 
+          WAREHOUSE_S3: 's3://dl-tfm-dgv-mbdde-dev-bucket/silver'
+          DB_NAME: !Ref DatabaseName
+          S3_LOGS: 'dl-tfm-dgv-mbdde-dev-emr-bucket'
+
+  ExecuteEmrNotebookLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ExecuteEmrNotebookLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn:
+        Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-bucket-arn
+
+Outputs:
+  ExecuteEmrNotebookFunctionArn:
+    Description: ARN of the ExecuteEmrNotebook Lambda
+    Value: !GetAtt ExecuteEmrNotebookLambdaFunction.Arn
+    Export:
+      Name: !Sub "${Project}-${Environment}-execute-${Domain}-emr-notebook-lambda-arn"
