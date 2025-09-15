@@ -1,0 +1,92 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Despliega la Lambda de transformación que Firehose invocará.
+
+Parameters:
+  Project:
+    Type: String
+    Description: Name of the project for the Tag
+    Default: "mbdde"
+  Environment:
+    Type: String
+    Description: Name of the environment for the Tag
+    Default: "dev"
+    AllowedValues:
+      - "dev"
+      - "pre"
+      - "qa"
+      - "stg"
+      - "demo"
+      - "ocu"
+      - "prod"
+  Student:
+    Description: Student owner
+    Type: String
+    Default: "dgv"
+    AllowedValues:
+      - "dgv"
+  Prefix:
+    Type: String
+    Default: "tfm"
+    Description: Platform id prefix
+    AllowedValues:
+      - "tfm"
+  CodeVersion:
+    Type: String
+    Default: "0.0.1"
+    Description: Version of the transformation code
+
+Resources:
+
+  TransformLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub dl-${Prefix}-${Student}-${Project}-${Environment}-transformation-lambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowInvokeWriter
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - Fn::ImportValue: !Sub "${Project}-${Environment}-to-iceberg-lambda-arn"
+
+  TransformLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub dl-${Prefix}-${Student}-${Project}-${Environment}-transformation-lambda
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Role: !GetAtt TransformLambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Sub 'config-${Prefix}-${Student}-${Project}-bucket'
+        S3Key: !Sub "transformation-lambda/transformation-lambda-${CodeVersion}.zip"
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          WRITER_FUNCTION_NAME: !Sub dl-${Prefix}-${Student}-${Project}-${Environment}-to-iceberg-lambda
+
+  TransformLambdaPermissionForFirehose:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref TransformLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: firehose.amazonaws.com
+
+Outputs:
+  TransformFunctionArn:
+    Description: ARN of the Iceberg writer Lambda
+    Value: !GetAtt TransformLambdaFunction.Arn
+    Export:
+      Name: !Sub "${Project}-${Environment}-transformation-lambda-arn"
