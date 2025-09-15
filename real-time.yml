@@ -1,0 +1,224 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Template to deploy real-time resources for the project.
+
+Parameters:
+  Project:
+    Type: String
+    Description: Name of the project for the Tag
+    Default: "mbdde"
+  Environment:
+    Type: String
+    Description: Name of the environment for the Tag
+    Default: "dev"
+    AllowedValues:
+      - "dev"
+      - "pre"
+      - "qa"
+      - "stg"
+      - "demo"
+      - "ocu"
+      - "prod"
+  Student:
+    Description: Student owner
+    Type: String
+    Default: "dgv"
+    AllowedValues:
+      - "dgv"
+  Prefix:
+    Type: String
+    Default: "tfm"
+    Description: Platform id prefix
+    AllowedValues:
+      - "tfm"
+  KdsDataRetentionPeriod:
+    Type: Number
+    Description: The number of hours for the data records that are stored in shards to remain accessible.
+    Default: 168
+  kfhBufferMaxIntervalInSeconds:
+    Type: Number
+    Description: Hints on the max Buffer ingestion interval. Must be between 60 and 900. AWS contraints on 2018-07
+    Default:  '900'
+  kfhBufferMaxSizeInMBs:
+    Type: Number
+    Description: Hints on the max Buffer incoming data in MB. AWS recommendation -> X MB bigger 10 sec of data received
+    Default:  '5'
+  KdsLogGroupRetentionInDays:
+    Type: Number
+    Description: Kinesis log groups retention period.
+    Default: 7
+
+Resources:
+
+  MeteorologyKinesisFlow:
+    Type: AWS::Kinesis::Stream
+    Properties:
+      Name: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-flow-meteorology-kinesisDataStream'
+      StreamModeDetails:
+        StreamMode: ON_DEMAND
+      RetentionPeriodHours: !Ref KdsDataRetentionPeriod
+      StreamEncryption:
+        EncryptionType: KMS
+        KeyId: 
+          Fn::ImportValue: !Sub '${Project}-${Environment}-datalake-kms-key-arn'
+
+
+  MeteorologyKinesisStreamFirehose:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    Properties:
+      DeliveryStreamName: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-flow-meteorology-kinesisFireHose'
+      DeliveryStreamType: KinesisStreamAsSource
+      KinesisStreamSourceConfiguration:
+        KinesisStreamARN: !GetAtt MeteorologyKinesisFlow.Arn
+        RoleARN: !GetAtt MeteorologyKinesisStreamRole.Arn
+      IcebergDestinationConfiguration:
+        RoleARN: !GetAtt MeteorologyKinesisStreamRole.Arn
+        CatalogConfiguration:
+          CatalogArn: !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+        DestinationTableConfigurationList:
+          -
+            DestinationDatabaseName: 
+              Fn::ImportValue: !Sub "${Project}-${Environment}-meteorology-database-name"
+            DestinationTableName: "default"
+        BufferingHints:
+          IntervalInSeconds: !Ref kfhBufferMaxIntervalInSeconds
+          SizeInMBs: !Ref kfhBufferMaxSizeInMBs
+        CloudWatchLoggingOptions:
+          Enabled: True
+          LogGroupName: !Ref kfhLogGroup
+          LogStreamName: !Ref kfhLogStream
+        ProcessingConfiguration:
+          Enabled: True
+          Processors:
+              - Type: Lambda
+                Parameters:
+                  - 
+                    ParameterName: LambdaArn
+                    ParameterValue: 
+                      Fn::ImportValue: !Sub "${Project}-${Environment}-transformation-lambda-arn"
+                  - 
+                    ParameterName: BufferIntervalInSeconds
+                    ParameterValue: 60
+                  - 
+                    ParameterName: BufferSizeInMBs
+                    ParameterValue: 3
+        S3Configuration:
+          ErrorOutputPrefix: !Sub "kinesis/failed-events/${Prefix}_${Student}_${Project}_meteorology_live/!{firehose:error-output-type}/"
+          BucketARN: 
+            Fn::ImportValue: !Sub '${Project}-${Environment}-datalake-bucket-arn'
+          Prefix: ""
+          BufferingHints:
+            IntervalInSeconds: !Ref kfhBufferMaxIntervalInSeconds
+            SizeInMBs: !Ref kfhBufferMaxSizeInMBs
+          CompressionFormat: UNCOMPRESSED
+          EncryptionConfiguration:
+            KMSEncryptionConfig:
+              AWSKMSKeyARN:
+                Fn::ImportValue: !Sub '${Project}-${Environment}-datalake-kms-key-arn'
+          RoleARN: !GetAtt MeteorologyKinesisStreamRole.Arn
+
+
+  MeteorologyKinesisStreamRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-flow-meteorology-kinesisFireHoseRole'
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service:
+                - firehose.amazonaws.com
+                - lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId': !Ref 'AWS::AccountId'
+      Policies:
+        -
+          PolicyName: deployment
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              # Read Kds
+              -
+                Effect: Allow
+                Action:
+                  - 'kinesis:DescribeStream'
+                  - 'kinesis:GetShardIterator'
+                  - 'kinesis:GetRecords'
+                  - 'kinesis:ListShards'
+                Resource:
+                  - !GetAtt MeteorologyKinesisFlow.Arn
+              # Use Kds kms
+              -
+                Effect: Allow
+                Action:
+                  - 'kms:GenerateDataKey'
+                  - 'kms:Decrypt'
+                  - 'kms:Encrypt'
+                  - 'kms:ReEncrypt*'
+                Resource:
+                  - Fn::ImportValue: !Sub '${Project}-${Environment}-datalake-kms-key-arn'
+              # Read and write on notoken landing s3
+              -
+                Effect: Allow
+                Action:
+                  - 's3:*'
+                Resource:
+                  - Fn::ImportValue: !Sub '${Project}-${Environment}-datalake-bucket-arn'
+                  - !Join 
+                    - ''
+                    - - Fn::ImportValue: !Sub '${Project}-${Environment}-datalake-bucket-arn'
+                      - '/*'
+              # Full cloudwatch
+              -
+                Effect: Allow
+                Action:
+                    - 'cloudwatch:*'
+                    - 'logs:*'
+                    - "glue:Get*"
+                    - "glue:UpdateTable"
+                Resource: '*'
+              -
+                Effect: Allow
+                Action:
+                  - 'sns:*'
+                Resource:
+                  - !Sub 'arn:aws:sns:${AWS::Region}:${AWS::AccountId}:*'
+              -
+                Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                  - 'lambda:GetFunctionConfiguration'
+                Resource:
+                  - Fn::ImportValue: !Sub "${Project}-${Environment}-transformation-lambda-arn"
+
+
+  kfhLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties:
+      LogGroupName: !Sub '/dl/${Prefix}-${Student}-${Project}-${Environment}/flow_meteorology/kinesisFireHose'
+      RetentionInDays: !Ref KdsLogGroupRetentionInDays
+
+  kfhLogStream:
+    Type: "AWS::Logs::LogStream"
+    Properties:
+      LogGroupName: !Ref kfhLogGroup
+      LogStreamName: 'S3Delivery'
+
+Outputs:
+  MeteorologyKinesisFlowName:
+    Description: "Kinesis Flow ARN"
+    Value: !Ref MeteorologyKinesisFlow
+    Export:
+      Name: !Sub "${Project}-${Environment}-kinesis-stream-name"
+
+  MeteorologyKinesisFlowArn:
+    Description: "Kinesis Flow Name"
+    Value: !GetAtt MeteorologyKinesisFlow.Arn
+    Export:
+      Name: !Sub "${Project}-${Environment}-kinesis-stream-arn"
+
+    
