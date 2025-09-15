@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Lambda that move arrivals files to silver layer.
+
+Parameters:
+  Project:
+    Type: String
+    Description: Name of the project for the Tag
+    Default: "mbdde"
+  Environment:
+    Type: String
+    Description: Name of the environment for the Tag
+    Default: "dev"
+    AllowedValues:
+      - "dev"
+      - "pre"
+      - "qa"
+      - "stg"
+      - "demo"
+      - "ocu"
+      - "prod"
+  Student:
+    Description: Student owner
+    Type: String
+    Default: "dgv"
+    AllowedValues:
+      - "dgv"
+  Prefix:
+    Type: String
+    Default: "tfm"
+    Description: Platform id prefix
+    AllowedValues:
+      - "tfm"
+  CodeVersion:
+    Type: String
+    Default: "0.0.1"
+    Description: Version of the transformation code
+
+Resources:
+
+  ToSilverEmtArrivalsLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub dl-${Prefix}-${Student}-${Project}-${Environment}-to-silver-emt-arrivals-lambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowInvokeWriter
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-bucket-arn
+                  - !Join
+                    - ''
+                    - 
+                      - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-bucket-arn
+                      - '/*'
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource:
+                  - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-kms-key-arn
+              - Effect: Allow
+                Action:
+                  - glue:GetDatabase
+                  - glue:GetTable
+                  - glue:CreateTable
+                  - glue:UpdateTable
+                  - glue:DeleteTable
+                  - glue:GetPartitions
+                  - glue:CreatePartition
+                  - glue:BatchCreatePartition
+                  - glue:UpdatePartition
+                  - glue:DeletePartition
+                  - glue:GetCatalog
+                  - glue:GetConnection
+                  - glue:GetTags
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/emt_silver
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/emt_silver/arrivals
+
+  ToSilverEmtArrivalsLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub dl-${Prefix}-${Student}-${Project}-${Environment}-to-silver-emt-arrivals-lambda
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Role: !GetAtt ToSilverEmtArrivalsLambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Sub 'config-${Prefix}-${Student}-${Project}-bucket'
+        S3Key: !Sub "to-silver-lambda/to-silver-lambda-${CodeVersion}.zip"
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          DATABASE_NAME: "emt"
+          TABLE_NAME: "arrivals"
+          SCHEMA: '[{"name": "timestamp", "type": "TimestampType()"}, {"name": "Arrive", "type": "ListType(StructType([(\"line\", StringType()), (\"stop\", StringType()), (\"isHead\", StringType()), (\"destination\", StringType()), (\"deviation\", StringType()), (\"bus\", StringType()), (\"geometry\", StructType([(\"type\", StringType()), (\"coordinates\", ListType(StringType()))])), (\"estimateArrive\", StringType()), (\"DistanceBus\", StringType()), (\"positionTypeBus\", StringType())]))"}, {"name": "StopInfo", "type": "ListType(StructType([(\"lines\", ListType(StringType())), (\"stopId\", StringType()), (\"stopName\", StringType()), (\"geometry\", StructType([(\"type\", StringType()), (\"coordinates\", ListType(StringType()))])), (\"Direction\", StringType())]))"}, {"name": "ExtraInfo", "type": "StringType()"}, {"name": "Incident.ListaIncident.data", "type": "StringType()"}, {"name": "stopId", "type": "StringType()"}, {"name": "line", "type": "StringType()"}]'
+
+  ToSilverEmtArrivalsLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ToSilverEmtArrivalsLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn:
+        Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-bucket-arn
+
+Outputs:
+  ToSilverEmtArrivalsFunctionArn:
+    Description: ARN of the ToSilverEmtArrivals Lambda
+    Value: !GetAtt ToSilverEmtArrivalsLambdaFunction.Arn
+    Export:
+      Name: !Sub "${Project}-${Environment}-to-silver-emt-arrivals-lambda-arn"
