@@ -1,0 +1,109 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Lambda that move files to bronze layer.
+
+Parameters:
+  Project:
+    Type: String
+    Description: Name of the project for the Tag
+    Default: "mbdde"
+  Environment:
+    Type: String
+    Description: Name of the environment for the Tag
+    Default: "dev"
+    AllowedValues:
+      - "dev"
+      - "pre"
+      - "qa"
+      - "stg"
+      - "demo"
+      - "ocu"
+      - "prod"
+  Student:
+    Description: Student owner
+    Type: String
+    Default: "dgv"
+    AllowedValues:
+      - "dgv"
+  Prefix:
+    Type: String
+    Default: "tfm"
+    Description: Platform id prefix
+    AllowedValues:
+      - "tfm"
+  CodeVersion:
+    Type: String
+    Default: "0.0.1"
+    Description: Version of the transformation code
+
+Resources:
+
+  ToBronzeLambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub dl-${Prefix}-${Student}-${Project}-${Environment}-to-bronze-lambdaRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowInvokeWriter
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - s3:ListBucket
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:DeleteObject
+                Resource:
+                  - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-bucket-arn
+                  - !Join
+                    - ''
+                    - 
+                      - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-bucket-arn
+                      - '/*'
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                Resource:
+                  - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-kms-key-arn
+
+  ToBronzeLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub dl-${Prefix}-${Student}-${Project}-${Environment}-to-bronze-lambda
+      Handler: app.lambda_handler
+      Runtime: python3.11
+      Role: !GetAtt ToBronzeLambdaExecutionRole.Arn
+      Code:
+        S3Bucket: !Sub 'config-${Prefix}-${Student}-${Project}-bucket'
+        S3Key: !Sub "to-bronze-lambda/to-bronze-lambda-${CodeVersion}.zip"
+      Timeout: 30
+      MemorySize: 256
+
+  ToBronzeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ToBronzeLambdaFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn:
+        Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-bucket-arn
+
+Outputs:
+  ToBronzeFunctionArn:
+    Description: ARN of the ToBronze Lambda
+    Value: !GetAtt ToBronzeLambdaFunction.Arn
+    Export:
+      Name: !Sub "${Project}-${Environment}-to-bronze-lambda-arn"
