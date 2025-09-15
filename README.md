@@ -5,37 +5,50 @@ Este repositorio contiene **infraestructura como código** (CloudFormation) y **
 ---
 
 ## 1) Arquitectura
-┌──────────────────────────┐           ┌───────────────────────┐
-│         Fuentes          │           │ Ingesta en tiempo real │
-│  EMT APIs / Excel        │           │  ECS (Fargate) Docker  │
-│  WeatherAPI (current)    │           │  → Kinesis DataStream  │
-└───────────┬──────────────┘           └───────────┬───────────┘
-            │                                      │
-            │ (ficheros xlsx)                      │ (JSON)
-            ▼                                      ▼
-      s3://dl-.../raw/                       Kinesis Data Stream
-            │                                      │
-            │                       ┌──────────────▼──────────────┐
-            │                       │   Kinesis Firehose (Iceberg)│
-            │                       │   + Lambda Transform         │
-            │                       └──────────────┬──────────────┘
-            │                                      │
-            ▼                                      ▼
-      s3://dl-.../bronze/                   s3://dl-.../silver/warehouse
-            │                           Glue Catalog + Iceberg (Silver)
-            │  (S3 event)                          │
-            │  Lambda execute-EMR                  │
-            ▼                                      │
-      EMR Serverless (Spark)  ─────────────────────┘
-            │
-            ▼
-  Glue Catalog + Iceberg (Silver)
-            │
-            │  Step Functions + EMR Serverless (Spark)
-            ▼
-  Glue Catalog + Iceberg (Gold)
-        ├─ emt_gold.arrivals_weather (hechos enriquecidos)
-        └─ emt_gold.delay_weather_hourly (agregados)
+
+```mermaid
+flowchart LR
+  %% ====== Estilo opcional ======
+  classDef storage fill:#f3f7ff,stroke:#5b8def,stroke-width:1px,color:#0b2b64;
+  classDef compute fill:#f9f9f9,stroke:#888,stroke-width:1px,color:#222;
+  classDef service fill:#fef6e4,stroke:#d09a00,stroke-width:1px,color:#3a2a00;
+  classDef catalog fill:#eefbea,stroke:#3aa655,stroke-width:1px,color:#1d4d2a;
+
+  %% ====== Fuentes ======
+  subgraph F[Fuentes]
+    A1[EMT APIs / Excel]:::service
+    A2[WeatherAPI (current)]:::service
+  end
+
+  %% ====== Ingesta batch (EMT) ======
+  A1 -- "ficheros .xlsx" --> S_RAW[(s3://dl-.../raw/)]:::storage
+  S_RAW -- "S3 Event" --> L_BZ[Lambda<br/>to-bronze]:::compute
+  L_BZ --> S_BZ[(s3://dl-.../bronze/)]:::storage
+
+  S_BZ -- "S3 Event" --> L_EMR[Lambda<br/>execute-emr-notebook]:::compute
+  L_EMR --> EMR_SV[EMR Serverless<br/>(Spark Excel → Silver)]:::compute
+
+  %% ====== Ingesta real-time (Meteorología) ======
+  A2 --> ECS[ECS Fargate Docker]:::compute
+  ECS --> KDS[Kinesis Data Stream]:::service
+  KDS --> KFH[Kinesis Firehose<br/>(destino Iceberg)]:::service
+  KFH -->|"+ Lambda Transform"| SILVER_WH[(s3://dl-.../silver/warehouse)]:::storage
+
+  %% ====== Escritura Silver (batch) ======
+  EMR_SV --> SILVER_WH
+
+  %% ====== Catálogo / Motor de tablas ======
+  SILVER_WH --> GLUE_SILVER[Glue Catalog + Iceberg<br/>(Silver)]:::catalog
+
+  %% ====== Orquestación GOLD ======
+  GLUE_SILVER -. "lectura" .-> SFN[Step Functions]:::service
+  SFN --> EMR_GOLD[EMR Serverless<br/>(Spark GOLD)]:::compute
+  EMR_GOLD --> GOLD_WH[(s3://dl-.../gold/warehouse)]:::storage
+  GOLD_WH --> GLUE_GOLD[Glue Catalog + Iceberg<br/>(Gold)]:::catalog
+
+  %% ====== Tablas GOLD ======
+  GLUE_GOLD --> T1[emt_gold.arrivals_weather<br/>(hechos enriquecidos)]:::catalog
+  GLUE_GOLD --> T2[emt_gold.delay_weather_hourly<br/>(agregados)]:::catalog
 
 
 Puntos clave
@@ -46,28 +59,48 @@ Puntos clave
 
 ## 2) Estructura del repositorio
 
+```text
 .
 ├── config-resources.yml                # S3 config bucket + KMS
-├── datalake-resources.yml              # S3 DL + Glue DBs + Athena WG
-├── real-time.yml                       # Kinesis + Firehose (Iceberg dest)
+├── datalake-resources.yml              # S3 Data Lake + Glue DBs + Athena WG
+├── real-time.yml                       # Kinesis Data Stream + Firehose (Iceberg dest)
 ├── emr-studio
 │   ├── emr-resources.yml               # EMR Studio + EMR Serverless + roles
-│   ├── emr-gold-layer.yml              # Step Functions + EventBridge para GOLD
+│   ├── emr-gold-layer.yml              # Step Functions + EventBridge (job GOLD)
 │   └── notebooks-jobs
-│       ├── emt-arrivals.py             # Spark → Silver arrivals
-│       ├── emt-lines.py                # Spark → Silver lines & timetable
-│       ├── meteorology.py              # Spark → Silver weather (Excel batch)
+│       ├── emt-arrivals.py             # Spark → Silver (arrivals)
+│       ├── emt-lines.py                # Spark → Silver (lines & timetable)
+│       ├── meteorology.py              # Spark → Silver (weather desde Excel batch)
 │       └── gold-layer.py               # Spark → GOLD (enriquecido + agregados)
 ├── lambdas
-│   ├── to-bronze-lambda/               # mueve raw/ → bronze/
-│   ├── execute-emr-notebook-lambda/    # dispara EMR Serverless (Spark Excel)
-│   ├── transformation-lambda/          # Transform de Firehose → llama writer
+│   ├── to-bronze-lambda/               # mueve s3://.../raw/ → s3://.../bronze/
+│   ├── execute-emr-notebook-lambda/    # dispara EMR Serverless (procesa Excel)
+│   ├── transformation-lambda/          # Firehose Transform → invoca writer
 │   └── to-iceberg-lambda/              # asegura tabla Iceberg (Athena DDL)
-├── microservices/meteorology-microservice
-│   ├── Dockerfile
-│   ├── meteorology-resources.yml       # ECS Service/Task + Secret + roles
-│   └── src/meteorology.py              # obtiene WeatherAPI y envía a Kinesis
-└── emt/                                # scripts auxiliares cliente EMT
+├── microservices
+│   └── meteorology-microservice
+│       ├── Dockerfile
+│       ├── meteorology-resources.yml   # ECS Service/Task + Secret + roles
+│       └── src
+│           ├── meteorology.py          # llama WeatherAPI y envía a Kinesis
+│           └── requirements.txt
+├── emt
+│   ├── arrivals
+│   │   ├── arrivals-YYYY-MM-DD.xlsx
+│   │   └── arrivals-bus.py             # cliente EMT: genera Excels de llegadas
+│   ├── lines
+│   │   ├── bus_lines.xlsx
+│   │   ├── bus_stops.xlsx
+│   │   ├── emt_lines.xlsx
+│   │   ├── lines-emt.py                # cliente EMT: líneas → Excel
+│   │   └── stops-in-lines-emt.py       # cliente EMT: paradas por línea → Excel
+│   └── stops
+│       ├── bus_stops.xlsx
+│       └── stops-emt.py                # cliente EMT: paradas → Excel
+├── meteorology-alternative
+│   ├── meteorology-YYYY-MM-DD.xlsx
+│   └── weather_to_excel.py             # alternativa batch (Excel) para meteo
+└── README.md
 
 ## 3) Prerrequisitos
 
