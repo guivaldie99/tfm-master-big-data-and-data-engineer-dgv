@@ -6,50 +6,68 @@ Este repositorio contiene **infraestructura como código** (CloudFormation) y **
 
 ## 1) Arquitectura
 
-```mermaid
-flowchart LR
-  %% Paletas
-  classDef storage fill:#eef4ff,stroke:#5b8def,stroke-width:1px,color:#0b2b64
-  classDef compute fill:#fbfbfb,stroke:#888,stroke-width:1px,color:#222
-  classDef service fill:#fff6e5,stroke:#d09a00,stroke-width:1px,color:#3a2a00
-  classDef catalog fill:#eefbea,stroke:#3aa655,stroke-width:1px,color:#1d4d2a
+┌──────────────────────────┐           ┌───────────────────────┐
 
-  %% Fuentes
-  subgraph Fuentes
-    EMT[EMT APIs / Excel]:::service
-    WX[WeatherAPI (current)]:::service
-  end
+│         Fuentes          │           │ Ingesta en tiempo real │
 
-  %% Ingesta batch (EMT)
-  EMT -->|"ficheros .xlsx"| S_RAW[(s3://dl-.../raw/)]:::storage
-  S_RAW -->|"S3 Event"| L_BZ[Lambda to-bronze]:::compute
-  L_BZ --> S_BZ[(s3://dl-.../bronze/)]:::storage
+│  EMT APIs / Excel        │           │  ECS (Fargate) Docker  │
 
-  S_BZ -->|"S3 Event"| L_EMR[Lambda execute-emr-notebook]:::compute
-  L_EMR --> EMR_SV[EMR Serverless (Spark Excel → Silver)]:::compute
+│  WeatherAPI (current)    │           │  → Kinesis DataStream  │
 
-  %% Ingesta real-time (Meteorología)
-  WX --> ECS[ECS Fargate (Docker)]:::compute
-  ECS --> KDS[Kinesis Data Stream]:::service
-  KDS --> KFH[Kinesis Firehose (Iceberg dest)]:::service
-  KFH -->|"Lambda Transform"| SILVER_WH[(s3://dl-.../silver/warehouse)]:::storage
+└───────────┬──────────────┘           └───────────┬───────────┘
 
-  %% Escritura Silver (batch)
-  EMR_SV --> SILVER_WH
-
-  %% Catálogo
-  SILVER_WH --> GLUE_SILVER[Glue Catalog + Iceberg (Silver)]:::catalog
-
-  %% Orquestación GOLD
-  GLUE_SILVER -. lectura .-> SFN[Step Functions]:::service
-  SFN --> EMR_GOLD[EMR Serverless (Spark GOLD)]:::compute
-  EMR_GOLD --> GOLD_WH[(s3://dl-.../gold/warehouse)]:::storage
-  GOLD_WH --> GLUE_GOLD[Glue Catalog + Iceberg (Gold)]:::catalog
-
-  %% Tablas GOLD
-  GLUE_GOLD --> T1[emt_gold.arrivals_weather (hechos)]:::catalog
-  GLUE_GOLD --> T2[emt_gold.delay_weather_hourly (agregados)]:::catalog
-
+            │                                      │
+			
+            │ (ficheros xlsx)                      │ (JSON)
+			
+            ▼                                      ▼
+			
+      s3://dl-.../raw/                       Kinesis Data Stream
+	  
+            │                                      │
+			
+            │                       ┌──────────────▼──────────────┐
+			
+            │                       │   Kinesis Firehose (Iceberg)│
+			
+            │                       │   + Lambda Transform         │
+			
+            │                       └──────────────┬──────────────┘
+			
+            │                                      │
+			
+            ▼                                      ▼
+			
+      s3://dl-.../bronze/                   s3://dl-.../silver/warehouse
+	  
+            │                           Glue Catalog + Iceberg (Silver)
+			
+            │  (S3 event)                          │
+			
+            │  Lambda execute-EMR                  │
+			
+            ▼                                      │
+			
+      EMR Serverless (Spark)  ─────────────────────┘
+	  
+            │
+			
+            ▼
+			
+  Glue Catalog + Iceberg (Silver)
+  
+            │
+			
+            │  Step Functions + EMR Serverless (Spark)
+			
+            ▼
+			
+  Glue Catalog + Iceberg (Gold)
+  
+        ├─ emt_gold.arrivals_weather (hechos enriquecidos)
+		
+        └─ emt_gold.delay_weather_hourly (agregados)
+		
 
 Puntos clave
     •    Iceberg v2 en S3, catálogo Glue.
