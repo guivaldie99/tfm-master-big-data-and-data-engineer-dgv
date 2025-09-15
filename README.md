@@ -6,42 +6,49 @@ Este repositorio contiene **infraestructura como código** (CloudFormation) y **
 
 ## 1) Arquitectura
 
+```mermaid
+flowchart LR
+  %% Paletas
+  classDef storage fill:#eef4ff,stroke:#5b8def,stroke-width:1px,color:#0b2b64
+  classDef compute fill:#fbfbfb,stroke:#888,stroke-width:1px,color:#222
+  classDef service fill:#fff6e5,stroke:#d09a00,stroke-width:1px,color:#3a2a00
+  classDef catalog fill:#eefbea,stroke:#3aa655,stroke-width:1px,color:#1d4d2a
 
-  %% ====== Fuentes ======
-  subgraph F[Fuentes]
-    A1[EMT APIs / Excel]:::service
-    A2[WeatherAPI (current)]:::service
+  %% Fuentes
+  subgraph Fuentes
+    EMT[EMT APIs / Excel]:::service
+    WX[WeatherAPI (current)]:::service
   end
 
-  %% ====== Ingesta batch (EMT) ======
-  A1 -- "ficheros .xlsx" --> S_RAW[(s3://dl-.../raw/)]:::storage
-  S_RAW -- "S3 Event" --> L_BZ[Lambda<br/>to-bronze]:::compute
+  %% Ingesta batch (EMT)
+  EMT -->|"ficheros .xlsx"| S_RAW[(s3://dl-.../raw/)]:::storage
+  S_RAW -->|"S3 Event"| L_BZ[Lambda to-bronze]:::compute
   L_BZ --> S_BZ[(s3://dl-.../bronze/)]:::storage
 
-  S_BZ -- "S3 Event" --> L_EMR[Lambda<br/>execute-emr-notebook]:::compute
-  L_EMR --> EMR_SV[EMR Serverless<br/>(Spark Excel → Silver)]:::compute
+  S_BZ -->|"S3 Event"| L_EMR[Lambda execute-emr-notebook]:::compute
+  L_EMR --> EMR_SV[EMR Serverless (Spark Excel → Silver)]:::compute
 
-  %% ====== Ingesta real-time (Meteorología) ======
-  A2 --> ECS[ECS Fargate Docker]:::compute
+  %% Ingesta real-time (Meteorología)
+  WX --> ECS[ECS Fargate (Docker)]:::compute
   ECS --> KDS[Kinesis Data Stream]:::service
-  KDS --> KFH[Kinesis Firehose<br/>(destino Iceberg)]:::service
-  KFH -->|"+ Lambda Transform"| SILVER_WH[(s3://dl-.../silver/warehouse)]:::storage
+  KDS --> KFH[Kinesis Firehose (Iceberg dest)]:::service
+  KFH -->|"Lambda Transform"| SILVER_WH[(s3://dl-.../silver/warehouse)]:::storage
 
-  %% ====== Escritura Silver (batch) ======
+  %% Escritura Silver (batch)
   EMR_SV --> SILVER_WH
 
-  %% ====== Catálogo / Motor de tablas ======
-  SILVER_WH --> GLUE_SILVER[Glue Catalog + Iceberg<br/>(Silver)]:::catalog
+  %% Catálogo
+  SILVER_WH --> GLUE_SILVER[Glue Catalog + Iceberg (Silver)]:::catalog
 
-  %% ====== Orquestación GOLD ======
-  GLUE_SILVER -. "lectura" .-> SFN[Step Functions]:::service
-  SFN --> EMR_GOLD[EMR Serverless<br/>(Spark GOLD)]:::compute
+  %% Orquestación GOLD
+  GLUE_SILVER -. lectura .-> SFN[Step Functions]:::service
+  SFN --> EMR_GOLD[EMR Serverless (Spark GOLD)]:::compute
   EMR_GOLD --> GOLD_WH[(s3://dl-.../gold/warehouse)]:::storage
-  GOLD_WH --> GLUE_GOLD[Glue Catalog + Iceberg<br/>(Gold)]:::catalog
+  GOLD_WH --> GLUE_GOLD[Glue Catalog + Iceberg (Gold)]:::catalog
 
-  %% ====== Tablas GOLD ======
-  GLUE_GOLD --> T1[emt_gold.arrivals_weather<br/>(hechos enriquecidos)]:::catalog
-  GLUE_GOLD --> T2[emt_gold.delay_weather_hourly<br/>(agregados)]:::catalog
+  %% Tablas GOLD
+  GLUE_GOLD --> T1[emt_gold.arrivals_weather (hechos)]:::catalog
+  GLUE_GOLD --> T2[emt_gold.delay_weather_hourly (agregados)]:::catalog
 
 
 Puntos clave
@@ -52,47 +59,85 @@ Puntos clave
 
 ## 2) Estructura del repositorio
 
-```text
 .
 ├── config-resources.yml                # S3 config bucket + KMS
+
 ├── datalake-resources.yml              # S3 Data Lake + Glue DBs + Athena WG
+
 ├── real-time.yml                       # Kinesis Data Stream + Firehose (Iceberg dest)
+
 ├── emr-studio
+
 │   ├── emr-resources.yml               # EMR Studio + EMR Serverless + roles
+
 │   ├── emr-gold-layer.yml              # Step Functions + EventBridge (job GOLD)
+
 │   └── notebooks-jobs
+
 │       ├── emt-arrivals.py             # Spark → Silver (arrivals)
+
 │       ├── emt-lines.py                # Spark → Silver (lines & timetable)
+
 │       ├── meteorology.py              # Spark → Silver (weather desde Excel batch)
+
 │       └── gold-layer.py               # Spark → GOLD (enriquecido + agregados)
+
 ├── lambdas
+
 │   ├── to-bronze-lambda/               # mueve s3://.../raw/ → s3://.../bronze/
+
 │   ├── execute-emr-notebook-lambda/    # dispara EMR Serverless (procesa Excel)
+
 │   ├── transformation-lambda/          # Firehose Transform → invoca writer
+
 │   └── to-iceberg-lambda/              # asegura tabla Iceberg (Athena DDL)
+
 ├── microservices
+
 │   └── meteorology-microservice
+
 │       ├── Dockerfile
+
 │       ├── meteorology-resources.yml   # ECS Service/Task + Secret + roles
+
 │       └── src
+
 │           ├── meteorology.py          # llama WeatherAPI y envía a Kinesis
+
 │           └── requirements.txt
+
 ├── emt
+
 │   ├── arrivals
+
 │   │   ├── arrivals-YYYY-MM-DD.xlsx
+
 │   │   └── arrivals-bus.py             # cliente EMT: genera Excels de llegadas
+
 │   ├── lines
+
 │   │   ├── bus_lines.xlsx
+
 │   │   ├── bus_stops.xlsx
+
 │   │   ├── emt_lines.xlsx
+
 │   │   ├── lines-emt.py                # cliente EMT: líneas → Excel
+
 │   │   └── stops-in-lines-emt.py       # cliente EMT: paradas por línea → Excel
+
 │   └── stops
+
 │       ├── bus_stops.xlsx
+
 │       └── stops-emt.py                # cliente EMT: paradas → Excel
+
 ├── meteorology-alternative
+
 │   ├── meteorology-YYYY-MM-DD.xlsx
+
 │   └── weather_to_excel.py             # alternativa batch (Excel) para meteo
+
 └── README.md
 
 ## 3) Prerrequisitos
