@@ -1,0 +1,678 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: "Template to deploy EMR Studio and Serverless resources for the ${Project} project. ${Prefix}-${Student}-${Project}-${Environment}. dl-tfm-dgv-mbd&de-dev. StackName: dl-emr-resources-dgv-mbdde"
+
+Parameters:
+  Project:
+    Type: String
+    Description: Name of the project for the Tag
+    Default: "mbdde"
+  Environment:
+    Type: String
+    Description: Name of the environment for the Tag
+    Default: "dev"
+    AllowedValues:
+      - "dev"
+      - "pre"
+      - "qa"
+      - "stg"
+      - "demo"
+      - "ocu"
+      - "prod"
+  Student:
+    Description: Student owner
+    Type: String
+    Default: "dgv"
+    AllowedValues:
+      - "dgv"
+  Prefix:
+    Type: String
+    Default: "tfm"
+    Description: Platform id prefix
+    AllowedValues:
+      - "tfm"
+  EMRServerlessArchitecture:
+    Description: The CPU architecture of Datalake EMR Serverless Application.
+    Type: String
+    Default: "X86_64"
+  EMRServerlessReleaseLabel:
+    Description: The Datalake EMR release associated with the Serverless Application.
+    Type: String
+    Default: "emr-7.0.0"
+  EmrStudioUserName:
+    Type: String
+    Description: SSO UserName para la sesión de EMR Studio
+    AllowedPattern: '[\w.@-]+'
+    NoEcho: true
+  SubnetOverride:
+    Type: CommaDelimitedList
+    Description: Use SubnetID for AZ problems
+
+Conditions:
+  HasEmrStudioUserName: !Not [ !Equals [ !Ref EmrStudioUserName, '' ]]
+  UseSubnetOverride: !Not [!Equals [!Join ["", !Ref SubnetOverride], ""]]   
+
+Resources:
+
+  ProjectKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "KMS key for ${Prefix}-${Student}-${Project} EMR in ${Environment} environment"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: KeyPolicy
+        Statement:
+          - Sid: KeyAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: KeyWrite
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+            Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Student
+
+  ProjectKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${Prefix}-${Student}-${Project}-${Environment}-emr-kms-key"
+      TargetKeyId: !Ref ProjectKmsKey
+
+  ProjectBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-emr-bucket'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt ProjectKmsKey.Arn
+            BucketKeyEnabled: true
+
+  ProjectBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ProjectBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - s3:ListBucket
+            Resource: !GetAtt ProjectBucket.Arn
+          - Sid: AllowRootAccountObjectAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:PutObjectAcl
+              - s3:GetObjectAcl
+            Resource: 
+              - !GetAtt ProjectBucket.Arn
+              - !Join [ '', [ !GetAtt ProjectBucket.Arn, '/*' ] ]
+
+
+###### EMR Studio and Serverless Resources ######
+
+  EmrServerlessRole:
+    Type: 'AWS::IAM::Role'
+    Condition: HasEmrStudioUserName
+    Properties:
+      RoleName: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-emr-serverless-role'
+      Description: !Sub 'Role for ${Project} Deploy EMR Serverless'
+      Policies:
+        -
+          PolicyName: s3
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - 
+                Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:DeleteObject'
+                  - 's3:GetEncryptionConfiguration'
+                  - "s3:AbortMultipartUpload"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:ListMultipartUploadParts"
+                  - "s3:GetBucketLocation"
+                Resource: 
+                  - !GetAtt ProjectBucket.Arn
+                  - !Join [ '', [ !GetAtt ProjectBucket.Arn, '/*' ] ]
+                  - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-bucket-arn
+                  - !Join
+                    - ''
+                    - 
+                      - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-bucket-arn
+                      - '/*'
+                  - 'arn:aws:s3:::config-tfm-dgv-mbdde-bucket'
+                  - 'arn:aws:s3:::config-tfm-dgv-mbdde-bucket/*'
+        -       
+          PolicyName: kms
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "kms:GenerateDataKey"
+                  - "kms:Decrypt"
+                  - "kms:Encrypt"
+                  - "kms:ReEncrypt*"
+                  - "kms:GenerateData*"
+                Resource:
+                  - !GetAtt ProjectKmsKey.Arn
+                  - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-kms-key-arn
+                  - '*'
+        -
+          PolicyName: glue
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "glue:ListSchemas"
+                  - "glue:ListSchemaVersions"
+                  - "glue:GetSchema"
+                  - "glue:GetSchemaVersion"
+                  - "glue:QuerySchemaVersionMetadata"
+                Resource:
+                  # Glue doesnt support GetAtt Arn yet
+                  - "*"
+                  # - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:registry/obdl-${Environment}-${Country}-glue-schema-registry" #REVIEW
+                  # - !Sub "arn:aws:glue:${AWS::Region}:${AWS::AccountId}:schema/obdl-${Environment}-${Country}-glue-schema-registry/*" #REVIEW
+              -
+                Effect: "Allow"
+                Action:
+                  - "glue:DeletePartition"
+                  - "glue:DeleteTable"
+                  - "glue:GetUserDefinedFunction*"
+                  - "glue:*Table*"
+                  - "glue:*Database*"
+                  - "glue:*Partition*"
+                Resource:
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:catalog
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:database/${Prefix}_${Student}_${Project}*
+                  - !Sub arn:aws:glue:${AWS::Region}:${AWS::AccountId}:table/${Prefix}_${Student}_${Project}*/*
+        -
+          PolicyName: cloudwatch
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - 'logs:DescribeLogGroups'
+                  - 'logs:DescribeLogStreams'
+                  - 'logs:CreateLogGroup'
+                  - 'logs:CreateLogStream'
+                  - 'logs:PutLogEvents'
+                  - 'cloudwatch:PutMetricData'
+                Resource: '*'
+        -
+          PolicyName: test
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - elasticmapreduce:StartNotebookExecution
+                  - elasticmapreduce:DescribeEditor
+                  - elasticmapreduce:ListEditors
+                Resource: 
+                  - !Sub arn:aws:elasticmapreduce:${AWS::Region}:${AWS::AccountId}:editor/*
+                  - !Sub arn:aws:elasticmapreduce:${AWS::Region}:${AWS::AccountId}:notebook-execution/*
+                  - !Sub arn:aws:elasticmapreduce:${AWS::Region}:${AWS::AccountId}:cluster/*
+              - Effect: Allow
+                Action:
+                  - emr-serverless:StartApplication
+                  - emr-serverless:GetApplication
+                  - emr-serverless:ListApplications
+                Resource: "*"
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - emr-serverless.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+
+  EmrStudioSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Condition: HasEmrStudioUserName
+    Properties:
+      GroupName: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-emr-studio-sg'
+      GroupDescription: !Sub "Grant Access to the DB cluster to the ECS cluster instances ${Project}"
+      VpcId:
+        Fn::ImportValue: SpokeVPC
+
+  EmrServerlessSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Condition: HasEmrStudioUserName
+    Properties:
+      GroupName: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-emr-serverless-sg'
+      GroupDescription: Security Group for EMR Serverless
+      VpcId:
+        Fn::ImportValue: SpokeVPC
+
+  EmrStudioWorkspaceSG:
+    Type: 'AWS::EC2::SecurityGroup'
+    Condition: HasEmrStudioUserName
+    Properties:
+      GroupName: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-emr-workspace-sg'
+      GroupDescription: Grant Access to the DB cluster to the ECS cluster instances 
+      VpcId:
+        Fn::ImportValue: SpokeVPC
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+
+  EmrStudioSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: HasEmrStudioUserName
+    Properties:
+      GroupId: !Ref EmrStudioSG
+      IpProtocol: 'tcp'
+      FromPort: 18888
+      ToPort: 18888
+      SourceSecurityGroupId: !Ref EmrStudioWorkspaceSG
+
+  WorkspaceSGSecurityGroupEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Condition: HasEmrStudioUserName
+    Properties:
+      GroupId: !Ref EmrStudioWorkspaceSG
+      IpProtocol: 'tcp'
+      FromPort: 18888
+      ToPort: 18888
+      DestinationSecurityGroupId: !Ref EmrStudioSG
+
+  EmrStudioServiceRole:
+    Type: AWS::IAM::Role
+    Condition: HasEmrStudioUserName
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - elasticmapreduce.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Description: !Sub "Service role for EMR Studio ${Project}"
+      RoleName: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-emr-studio-service-role'
+      Policies:
+        -
+          PolicyName: emrstudio
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              -
+                Effect: "Allow"
+                Action:
+                  - "kms:GenerateDataKey"
+                  - "kms:Decrypt"
+                  - "kms:Encrypt"
+                  - "kms:ReEncrypt*"
+                  - "kms:DescribeKey"
+                Resource:
+                  - !GetAtt ProjectKmsKey.Arn
+                  - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-kms-key-arn
+              - 
+                Effect: Allow
+                Action:
+                  - 's3:ListBucket'
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:GetEncryptionConfiguration'
+                  - "s3:AbortMultipartUpload"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:ListMultipartUploadParts"
+                  - "s3:GetBucketLocation"
+                Resource: 
+                  - !GetAtt ProjectBucket.Arn
+                  - !Join [ '', [ !GetAtt ProjectBucket.Arn, '/*' ] ]
+                  - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-bucket-arn
+                  - !Join
+                    - ''
+                    - 
+                      - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-bucket-arn
+                      - '/*'
+              - 
+                Effect: Allow
+                Action:
+                  - 's3:DeleteObject'
+                Resource: 
+                  - !Join [ '', [ !GetAtt ProjectBucket.Arn, '/*' ] ]
+              - 
+                Effect: Allow
+                Action:
+                  - "ec2:AuthorizeSecurityGroupEgress"
+                  - "ec2:AuthorizeSecurityGroupIngress"
+                  - "ec2:CreateSecurityGroup"
+                  - "ec2:DescribeSecurityGroups"
+                  - "ec2:RevokeSecurityGroupEgress"
+                  - "ec2:CreateNetworkInterface"
+                  - "ec2:CreateNetworkInterfacePermission"
+                  - "ec2:DeleteNetworkInterface"
+                  - "ec2:DeleteNetworkInterfacePermission"
+                  - "ec2:DescribeNetworkInterfaces"
+                  - "ec2:ModifyNetworkInterfaceAttribute"
+                  - "ec2:DescribeTags"
+                  - "ec2:DescribeInstances"
+                  - "ec2:DescribeSubnets"
+                  - "ec2:DescribeVpcs"
+                  - "elasticmapreduce:ListInstances"
+                  - "elasticmapreduce:DescribeCluster"
+                  - "elasticmapreduce:ListSteps"
+                Resource: '*'
+              - 
+                Effect: Allow
+                Action: ec2:CreateTags
+                Resource: arn:aws:ec2:*:*:network-interface/*
+                Condition:
+                  ForAllValues:StringEquals:
+                    aws:TagKeys:
+                      - aws:elasticmapreduce:editor-id
+                      - aws:elasticmapreduce:job-flow-id
+      
+  EmrStudio:
+    Type: AWS::EMR::Studio
+    Condition: HasEmrStudioUserName
+    Properties: 
+      AuthMode: SSO
+      DefaultS3Location: !Join 
+        - ''
+        - - 's3://'
+          - !Ref ProjectBucket
+          - '/'
+          - !Ref Project
+          - '/'
+      Description: !Sub 'EMR Studio for ${Project}'
+      EngineSecurityGroupId: !Ref EmrStudioSG
+      Name: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-emr-studio'
+      ServiceRole: !GetAtt EmrStudioServiceRole.Arn
+      UserRole: !GetAtt EMRStudioUserRole.Arn
+      SubnetIds: !If
+        - UseSubnetOverride
+        - !Ref SubnetOverride
+        - Fn::Split:
+          - ','
+          - Fn::ImportValue: SpokeVPC-private-subnets
+      VpcId:
+        Fn::ImportValue: SpokeVPC
+      WorkspaceSecurityGroupId: !Ref EmrStudioWorkspaceSG
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Student
+
+  EmrServerlessApp:
+    Type: AWS::EMRServerless::Application
+    Condition: HasEmrStudioUserName
+    Properties:
+      Name: !Sub "dl-${Prefix}-${Student}-${Project}-${Environment}-emr-studio-serverless-app"
+      ReleaseLabel: !Ref EMRServerlessReleaseLabel
+      Architecture: !Ref EMRServerlessArchitecture
+      Type: Spark
+      AutoStartConfiguration: 
+        Enabled: true
+      AutoStopConfiguration: 
+        Enabled: true
+        IdleTimeoutMinutes: 30
+      InitialCapacity: 
+        - Key: Driver
+          Value:
+            WorkerCount: 1
+            WorkerConfiguration:
+              Cpu: 1 vCPU
+              Memory: 7 GB
+              Disk: 32 GB
+        - Key: Executor
+          Value:
+            WorkerCount: 2
+            WorkerConfiguration:
+              Cpu: 1 vCPU
+              Memory: 7 GB
+              Disk: 32 GB
+      MaximumCapacity:
+        Cpu: 400 vCPU
+        Memory: 3000 GB
+        Disk: 20000 GB
+      MonitoringConfiguration: 
+        ManagedPersistenceMonitoringConfiguration: 
+          Enabled: true
+        CloudWatchLoggingConfiguration: 
+          Enabled: True
+          LogGroupName: !Sub "/dl/${Prefix}-${Student}-${Project}-${Environment}/emr-studio/${Project}/emr-studio-jupyter-logs"
+      NetworkConfiguration: 
+        SecurityGroupIds:  
+          - !Ref EmrServerlessSG
+        SubnetIds: !If
+          - UseSubnetOverride
+          - !Ref SubnetOverride
+          - Fn::Split:
+            - ','
+            - Fn::ImportValue: SpokeVPC-private-subnets
+      RuntimeConfiguration: 
+        - Classification: 'spark-defaults'
+          Properties: {"spark.sql.catalogImplementation":"hive","spark.hadoop.hive.metastore.client.factory.class":"com.amazonaws.glue.catalog.metastore.AWSGlueDataCatalogHiveClientFactory"}
+      InteractiveConfiguration:
+        StudioEnabled: true
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Student
+
+  EMRStudioUserRole:
+    Type: AWS::IAM::Role
+    Condition: HasEmrStudioUserName
+    Properties:
+      RoleName: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-emr-studio-user-role'
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - elasticmapreduce.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+              - 'sts:SetContext'
+      Description: "User role for EMR Studio"
+
+  EmrStudioBasicUserPolicy:
+    Type: "AWS::IAM::ManagedPolicy"
+    Condition: HasEmrStudioUserName
+    Properties:
+      Description: "Policy to set boundaries for EMR Studio groups"
+      Roles: 
+        - !Ref EMRStudioUserRole
+      ManagedPolicyName: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-emr-studio-basic-user-policy'
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+        - 
+          Effect: Allow
+          Action:
+            - "elasticmapreduce:CreateEditor"
+            - "elasticmapreduce:DescribeEditor"
+            - "elasticmapreduce:ListEditors"
+            - "elasticmapreduce:StartEditor"
+            - "elasticmapreduce:StopEditor"
+            - "elasticmapreduce:OpenEditorInConsole"
+            - "elasticmapreduce:AttachEditor"
+            - "elasticmapreduce:DetachEditor"
+            - "elasticmapreduce:CreateRepository"
+            - "elasticmapreduce:DescribeRepository"
+            - "elasticmapreduce:DeleteRepository"
+            - "elasticmapreduce:ListRepositories"
+            - "elasticmapreduce:LinkRepository"
+            - "elasticmapreduce:UnlinkRepository"
+            - "elasticmapreduce:DescribeCluster"
+            - "elasticmapreduce:ListInstanceGroups"
+            - "elasticmapreduce:ListBootstrapActions"
+            - "elasticmapreduce:ListClusters"
+            - "elasticmapreduce:ListSteps"
+            - "elasticmapreduce:CreatePersistentAppUI"
+            - "elasticmapreduce:DescribePersistentAppUI"
+            - "elasticmapreduce:GetPersistentAppUIPresignedURL"
+            - "elasticmapreduce:GetOnClusterAppUIPresignedURL"
+          Resource: "*"
+        - 
+          Effect: Allow
+          Action:
+            - "elasticmapreduce:DeleteEditor"
+          Resource: "*"
+          Condition:
+            StringEquals:
+              "elasticmapreduce:ResourceTag/creatorUserId": "${aws:userId}"
+        - 
+          Effect: Allow
+          Action:
+            - "secretsmanager:TagResource"
+          Resource: 
+            - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/dl/${Prefix}-${Student}-${Project}-${Environment}/emr-studio/*'
+        -
+          Effect: Allow
+          Action:
+          - "secretsmanager:CreateSecret"
+          Resource: 
+          - !Sub 'arn:${AWS::Partition}:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:/dl/${Prefix}-${Student}-${Project}-${Environment}/emr-studio/*'
+          Condition:
+            StringEquals:
+              "aws:RequestTag/for-use-with-amazon-emr-managed-policies": "true"
+        - 
+          Effect: Allow
+          Action: 
+            - "emr-containers:DescribeVirtualCluster"
+            - "emr-containers:ListVirtualClusters"
+            - "emr-containers:DescribeManagedEndpoint"
+            - "emr-containers:ListManagedEndpoints"
+            - "emr-containers:DescribeJobRun"
+            - "emr-containers:ListJobRuns"
+          Resource: "*"
+        - 
+          Effect: Allow
+          Action: "secretsmanager:ListSecrets"
+          Resource: "*"
+        - 
+          Effect: Allow
+          Action: "iam:PassRole"
+          Resource: 
+            - !GetAtt EmrStudioServiceRole.Arn
+            - !GetAtt EmrServerlessRole.Arn
+        -
+          Effect: Allow
+          Action: "iam:ListRoles"
+          Resource: "*"
+        - 
+          Effect: Allow
+          Action:
+            - "s3:ListAllMyBuckets"  
+            - "s3:ListBucket"  
+            - "s3:GetBucketLocation"
+          Resource: "arn:aws:s3:::*"
+        -
+          Effect: "Allow"
+          Action:
+            - "kms:GenerateDataKey"
+            - "kms:Decrypt"
+            - "kms:Encrypt"
+            - "kms:ReEncrypt*"
+            - "kms:GenerateData*"
+          Resource:
+            - !GetAtt ProjectKmsKey.Arn
+        - 
+          Effect: Allow
+          Action:
+            - "elasticmapreduce:UpdateEditor"
+            - "elasticmapreduce:PutWorkspaceAccess"
+            - "elasticmapreduce:DeleteWorkspaceAccess"
+            - "elasticmapreduce:ListWorkspaceAccessIdentities"
+          Resource: "*"
+          Condition:
+            StringEquals:
+              "elasticmapreduce:ResourceTag/creatorUserId": "${aws:userId}"
+        - 
+          Effect: Allow
+          Action: 
+            - "emr-serverless:CreateApplication"
+            - "emr-serverless:UpdateApplication"
+            - "emr-serverless:DeleteApplication"
+            - "emr-serverless:ListApplications"
+            - "emr-serverless:GetApplication"
+            - "emr-serverless:StartApplication"
+            - "emr-serverless:StopApplication"
+            - "emr-serverless:StartJobRun"
+            - "emr-serverless:CancelJobRun"
+            - "emr-serverless:ListJobRuns"
+            - "emr-serverless:GetJobRun"
+            - "emr-serverless:GetDashboardForJobRun"
+            - "emr-serverless:AccessInteractiveEndpoints"
+            - "emr-serverless:ListTagsForResource"
+            - "emr-serverless:ListJobRunAttempts"
+          Resource: "*"
+        - 
+          Effect: Allow
+          Action: 
+            - "ec2:DescribeSecurityGroups"
+            - "ec2:DescribeNetworkInterfaces"
+            - "ec2:DescribeTags"
+            - "ec2:DescribeInstances"
+            - "ec2:DescribeSubnets"
+            - "ec2:DescribeVpcs"
+            - "ec2:CreateNetworkInterface"
+          Resource: "*"
+
+  EmrStudioGroupSessionMapping:
+    Condition: HasEmrStudioUserName
+    Type: AWS::EMR::StudioSessionMapping
+    Properties: 
+      IdentityName: !Ref EmrStudioUserName
+      IdentityType: 'USER'
+      SessionPolicyArn: !Ref EmrStudioBasicUserPolicy
+      StudioId: !GetAtt EmrStudio.StudioId
+
+###### EMR Studio and Serverless Resources END ######
+
+Outputs:
+  EMRKmsKeyArn:
+    Description: ARN Datalake KMS Key
+    Value: !GetAtt ProjectKmsKey.Arn
+    Export:
+      Name: !Sub "${Project}-${Environment}-emr-kms-key-arn"

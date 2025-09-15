@@ -1,0 +1,264 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Orquesta el job GOLD (EMR Serverless) con Step Functions + EventBridge (TFM DGV MBDDE)
+
+Parameters:
+  Project:
+    Type: String
+    Description: Name of the project for the Tag
+    Default: "mbdde"
+  Environment:
+    Type: String
+    Description: Name of the environment for the Tag
+    Default: "dev"
+    AllowedValues:
+      - "dev"
+      - "pre"
+      - "qa"
+      - "stg"
+      - "demo"
+      - "ocu"
+      - "prod"
+  Student:
+    Description: Student owner
+    Type: String
+    Default: "dgv"
+    AllowedValues:
+      - "dgv"
+  Prefix:
+    Type: String
+    Default: "tfm"
+    Description: Platform id prefix
+    AllowedValues:
+      - "tfm"
+  EmrApplicationId:
+    Type: String
+    Description: EMR Serverless ApplicationId (ej. 00fgg0h1ijklmnopqrstuvwx)
+    Default: 00fv4tbtp4i4a70p
+  EmrRuntimeRoleArn:
+    Type: String
+    Description: ARN del rol de ejecución de EMR Serverless (que usa el job)
+    Default: arn:aws:iam::209399683472:role/dl-tfm-dgv-mbdde-dev-emr-serverless-role
+  JobsBucket:
+    Type: String
+    Description: Bucket S3 donde está el código (ej. my-bucket-config)
+    Default: dl-tfm-dgv-mbdde-dev-emr-bucket
+  JobsKey:
+    Type: String
+    Default: mbdde/e-98K87HLK7LR0EYQE4Z1WXX8Z2/gold_layer.py
+    Description: Key del script en S3 (ruta al emt_gold.py)
+  WarehouseUri:
+    Type: String
+    Description: URI del warehouse Iceberg (ej. s3://my-warehouse-bucket/silver/warehouse)
+    Default: s3://dl-tfm-dgv-mbdde-dev-bucket/gold
+  GoldDbName:
+    Type: String
+    Default: tfm_dgv_mbdde_gold
+    Description: Nombre de la base GOLD donde escribirá el job
+  DelayRatioThresh:
+    Type: String
+    Default: '1.3'
+    Description: Umbral de retraso (arrival/ETA) para considerar retraso
+  WxRecentMinutes:
+    Type: String
+    Default: '60'
+    Description: Ventana de minutos de meteorología para join temporal
+  LogsPrefix:
+    Type: String
+    Default: emr-logs/
+    Description: Prefijo en el warehouse bucket para logs S3 (opcional)
+  ScheduleCron:
+    Type: String
+    Default: cron(0 10 * * ? *)
+    Description: Expresión CRON de EventBridge en UTC (p.ej. 10:00 UTC diario)
+  WarehouseBucket:
+    Type: String
+    Description: Bucket raíz del warehouse (solo el nombre, sin s3://)
+    Default: dl-tfm-dgv-mbdde-dev-bucket
+  TagsProject:
+    Type: String
+    Default: tfm-dgv-mbdde
+    Description: Tag de proyecto
+  TagsLayer:
+    Type: String
+    Default: gold
+    Description: Tag de capa
+
+Resources:
+  ############################################
+  # IAM: Rol para la State Machine (Step Functions)
+  ############################################
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub dl-${Prefix}-${Student}-${Project}-${Environment}-sfn-emt-gold-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: sfn-emt-gold-emrserverless
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              # EMR Serverless control-plane
+              - Effect: Allow
+                Action:
+                  - emr-serverless:StartJobRun
+                  - emr-serverless:GetJobRun
+                  - emr-serverless:CancelJobRun
+                  - emr-serverless:TagResource
+                Resource:
+                  - !Sub arn:aws:emr-serverless:${AWS::Region}:${AWS::AccountId}:/applications/${EmrApplicationId}
+                  - !Sub arn:aws:emr-serverless:${AWS::Region}:${AWS::AccountId}:/applications/${EmrApplicationId}/jobruns/*
+              # Necesario para pasar el rol de runtime a EMR
+              - Effect: Allow
+                Action: iam:PassRole
+                Resource: !Sub arn:aws:iam::${AWS::AccountId}:role/dl-${Prefix}-${Student}-${Project}-${Environment}-emr-serverless-role
+              # Acceso a S3 (jobs + warehouse para logs S3)
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:ListBucket
+                Resource:
+                  - !Sub arn:aws:s3:::${JobsBucket}
+                  - !Sub arn:aws:s3:::${JobsBucket}/*
+                  - !Sub arn:aws:s3:::${WarehouseBucket}
+                  - !Sub arn:aws:s3:::${WarehouseBucket}/*
+
+  ############################################
+  # Step Functions: State Machine
+  ############################################
+  GoldStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: !Sub dl-${Prefix}-${Student}-${Project}-${Environment}-emt-gold-sfn
+      RoleArn: !GetAtt StateMachineRole.Arn
+      StateMachineType: STANDARD
+      DefinitionString:
+        Fn::Sub: |
+          {
+            "Comment": "Lanza gold_layer.py en EMR Serverless y espera a que termine",
+            "StartAt": "StartJobRun",
+            "States": {
+              "StartJobRun": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:emrserverless:startJobRun",
+                "Parameters": {
+                  "ApplicationId": "${EmrApplicationId}",
+                  "ExecutionRoleArn": "${EmrRuntimeRoleArn}",
+                  "ClientToken.$": "States.UUID()",
+                  "Name": "gold-job",
+                  "JobDriver": {
+                    "SparkSubmit": {
+                      "EntryPoint": "s3://${JobsBucket}/${JobsKey}",
+                      "EntryPointArguments": [
+                        "--warehouse","${WarehouseUri}",
+                        "--gold_db_emt","${GoldDbName}",
+                        "--silver_db_emt", "tfm_dgv_mbdde_emt_silver",
+                        "--silver_db_met", "tfm_dgv_mbdde_meteorology_silver",
+                        "--delay_ratio_thresh","${DelayRatioThresh}",
+                        "--wx_recent_minutes","${WxRecentMinutes}",
+                        "--tz","Europe/Madrid"
+                      ],
+                      "SparkSubmitParameters": "--conf spark.sql.catalog.glue_catalog=org.apache.iceberg.spark.SparkCatalog --conf spark.sql.catalog.glue_catalog.warehouse=${WarehouseUri} --conf spark.sql.catalog.glue_catalog.catalog-impl=org.apache.iceberg.aws.glue.GlueCatalog --conf spark.sql.catalog.glue_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO --conf spark.sql.extensions=org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions --conf spark.executor.instances=2 --conf spark.executor.memory=4g --conf spark.executor.cores=2 --conf spark.driver.memory=2g"
+                    }
+                  },
+                  "ConfigurationOverrides": {
+                    "MonitoringConfiguration": {
+                      "S3MonitoringConfiguration": {
+                        "LogUri": "s3://dl-tfm-dgv-mbdde-dev-emr-bucket/${LogsPrefix}"
+                      }
+                    }
+                  },
+                  "Tags": {
+                    "project": "${TagsProject}",
+                    "layer": "${TagsLayer}"
+                  }
+                },
+                "ResultPath": "$.job",
+                "Next": "Wait30s",
+                "Retry": [
+                  {
+                    "ErrorEquals": [ "States.TaskFailed", "EmrServerless.ThrottlingException", "EmrServerless.InternalServerException" ],
+                    "IntervalSeconds": 10,
+                    "MaxAttempts": 3,
+                    "BackoffRate": 2.0
+                  }
+                ]
+              },
+              "Wait30s": {
+                "Type": "Wait",
+                "Seconds": 30,
+                "Next": "GetJobRun"
+              },
+              "GetJobRun": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::aws-sdk:emrserverless:getJobRun",
+                "Parameters": {
+                  "ApplicationId.$": "$.job.ApplicationId",
+                  "JobRunId.$": "$.job.JobRunId"
+                },
+                "ResultPath": "$.status",
+                "Next": "CheckStatus"
+              },
+              "CheckStatus": {
+                "Type": "Choice",
+                "Choices": [
+                  { "Variable": "$.status.JobRun.State", "StringEquals": "SUCCESS", "Next": "Success" },
+                  { "Variable": "$.status.JobRun.State", "StringEquals": "FAILED", "Next": "Failed" },
+                  { "Variable": "$.status.JobRun.State", "StringEquals": "CANCELLING", "Next": "Failed" },
+                  { "Variable": "$.status.JobRun.State", "StringEquals": "CANCELLED", "Next": "Failed" }
+                ],
+                "Default": "Wait30s"
+              },
+              "Success": { "Type": "Succeed" },
+              "Failed": { "Type": "Fail", "Cause": "EMR Serverless job failed or was cancelled" }
+            }
+          }
+
+  ############################################
+  # IAM: Rol para que EventBridge pueda StartExecution
+  ############################################
+  EventBridgeInvokeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub dl-${Prefix}-${Student}-${Project}-${Environment}-evb-invoke-sfn-emt-gold
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: evb-can-start-sfn
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref GoldStateMachine
+
+  ############################################
+  # EventBridge: regla de programación
+  ############################################
+  GoldDailyRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub dl-${Prefix}-${Student}-${Project}-${Environment}-emt-gold-daily
+      Description: Lanza la State Machine del GOLD según cron
+      ScheduleExpression: !Ref ScheduleCron
+      State: ENABLED
+      Targets:
+        - Id: StartGoldStateMachine
+          Arn: !Ref GoldStateMachine
+          RoleArn: !GetAtt EventBridgeInvokeRole.Arn
+          Input: !Sub |
+            {
+              "db": "${GoldDbName}",
+              "delay_ratio_thresh": "${DelayRatioThresh}",
+              "wx_recent_minutes": "${WxRecentMinutes}"
+            }
