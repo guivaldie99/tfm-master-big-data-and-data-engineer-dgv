@@ -1,0 +1,248 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Template to deploy Meteorology resources for the project.
+
+Parameters:
+  Project:
+    Type: String
+    Description: Name of the project for the Tag
+    Default: "mbdde"
+  Environment:
+    Type: String
+    Description: Name of the environment for the Tag
+    Default: "prod"
+    AllowedValues:
+      - "dev"
+      - "pre"
+      - "qa"
+      - "stg"
+      - "demo"
+      - "ocu"
+      - "prod"
+  Student:
+    Description: Student owner
+    Type: String
+    Default: "dgv"
+    AllowedValues:
+      - "dgv"
+  Prefix:
+    Type: String
+    Default: "tfm"
+    Description: Platform id prefix
+    AllowedValues:
+      - "tfm"
+  ECRAccountId:
+    Type: String
+    Description: ECR AWS Account Id
+    Default: 209399683472
+    MaxLength: 12
+    MinLength: 12
+  ApyKeyMeterology:
+    Type: String
+    Description: API Key for Meteorology service
+    NoEcho: true
+  DeployStack:
+    Type: String
+    Default: "true"
+    Description: Platform id prefix
+    AllowedValues:
+      - "true"
+      - "false"
+  SubnetOverride:
+    Type: CommaDelimitedList
+    Description: Use SubnetID for AZ problems
+
+Conditions:
+  DeployStack: !Equals [!Ref DeployStack, "true"]
+  UseSubnetOverride: !Not [!Equals [!Join ["", !Ref SubnetOverride], ""]]
+
+Resources:
+  MeteorologyExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Condition: DeployStack
+    Properties:
+      RoleName: !Sub meteorology-${Prefix}-${Student}-${Project}-${Environment}-exec-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - 'ecs-tasks.amazonaws.com'
+            Action:
+              - 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
+      Policies:
+        -
+          PolicyName: EC2
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeImages
+                  - ec2:DescribeImageAttribute
+                  - ec2:DeregisterImage
+                  - ec2:DeleteSnapshot
+                Resource: "*"
+        -
+          PolicyName: S3
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:PutObject
+                  - s3:PutObjectAcl
+                Resource: 
+                  - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-bucket-arn
+                  - !Join 
+                    - ""
+                    - - Fn::ImportValue: !Sub ${Project}-${Environment}-datalake-bucket-arn
+                      - "/*"
+        -
+          PolicyName: KMS
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kms:Encrypt
+                  - kms:Decrypt
+                  - kms:ReEncrypt*
+                  - kms:GenerateDataKey*
+                  - kms:DescribeKey
+                  - kms:CreateGrant
+                Resource: "*"
+                Condition:
+                  ForAnyValue:StringLike:
+                    kms:ResourceAliases:
+                      - Fn::ImportValue: !Sub "${Project}-${Environment}-datalake-kms-key-alias"
+        -
+          PolicyName: SecretsManager
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref MeteorologySecret
+        -
+          PolicyName: Kinesis
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - kinesis:PutRecord
+                  - kinesis:PutRecords
+                Resource: 
+                  - Fn::ImportValue: !Sub "${Project}-${Environment}-kinesis-stream-arn"
+
+  MeteorologyDockerLogGroup:
+    Type: "AWS::Logs::LogGroup"
+    Condition: DeployStack
+    Properties:
+      LogGroupName: !Sub meteorology-${Prefix}-${Student}-${Project}-${Environment}-docker
+      RetentionInDays: 7
+
+  MeteorologyDockerTaskDefinition:
+    Type: 'AWS::ECS::TaskDefinition'
+    Condition: DeployStack
+    Properties:
+      TaskRoleArn: !GetAtt MeteorologyExecutionRole.Arn
+      ExecutionRoleArn: !GetAtt MeteorologyExecutionRole.Arn
+      Memory: 2048
+      Cpu: 1024
+      NetworkMode: awsvpc
+      Family: !Sub "meteorology-docker-${Prefix}-${Student}-${Project}-${Environment}"
+      RuntimePlatform:
+        CpuArchitecture: ARM64
+        OperatingSystemFamily: LINUX
+      RequiresCompatibilities:
+        - FARGATE
+      ContainerDefinitions:
+        -
+          Name: !Sub "${Project}Docker"
+          Image: !Sub ${ECRAccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/meteorology:latest
+          Essential: true
+          Environment:
+            - Name: "SECRET_NAME"
+              Value: !Ref MeteorologySecret
+            - Name: "KINESIS_STREAM_NAME"
+              Value: 
+                Fn::ImportValue: !Sub "${Project}-${Environment}-kinesis-stream-name"
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref MeteorologyDockerLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: "service"
+
+  MeteorologyDockerService:
+    Type: AWS::ECS::Service
+    Condition: DeployStack
+    Properties:
+      ServiceName: !Sub "meteorology-docker-${Prefix}-${Student}-${Project}-${Environment}-service"
+      Cluster: 'Microservices-pre'
+      TaskDefinition: !Ref MeteorologyDockerTaskDefinition
+      DesiredCount: 1
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref MeteorologyDockerSG
+          Subnets: !If
+            - UseSubnetOverride
+            - !Ref SubnetOverride
+            - Fn::Split:
+                - ','
+                - Fn::ImportValue: SpokeVPC-private-subnets
+      EnableExecuteCommand: true
+      PropagateTags: SERVICE
+      DeploymentConfiguration:
+        MaximumPercent: 200
+        MinimumHealthyPercent: 50
+
+  MeteorologyDockerSG:
+    Type: AWS::EC2::SecurityGroup
+    Condition: DeployStack
+    Properties:
+      GroupDescription: !Sub "SG Fargate meteorology - ${Project}-${Environment}"
+      VpcId:
+        Fn::ImportValue: SpokeVPC
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub "meteorology-${Prefix}-${Student}-${Project}-${Environment}-sg"
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Student
+
+  MeteorologySecret:
+    Type: AWS::SecretsManager::Secret
+    UpdateReplacePolicy: Retain
+    DeletionPolicy: Retain
+    Properties:
+      Name: !Sub "dl-${Prefix}-${Student}-${Project}-${Environment}-meteorology-secret"
+      Description: Secret for credentials of meteorology service
+      KmsKeyId: 
+        Fn::ImportValue: !Sub "${Project}-${Environment}-datalake-kms-key-arn"
+      SecretString: !Sub '{"api_key":"${ApyKeyMeterology}"}'
+      Tags: 
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Student
