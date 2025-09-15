@@ -1,0 +1,4 @@
+pandas
+pyarrow
+pyiceberg
+pydantic<2.0.0,>=1.8.2
