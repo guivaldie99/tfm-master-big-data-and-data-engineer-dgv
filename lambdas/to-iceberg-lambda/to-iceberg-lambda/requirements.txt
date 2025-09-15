@@ -1,0 +1,2 @@
+pyiceberg
+boto3
