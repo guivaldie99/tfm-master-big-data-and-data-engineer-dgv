@@ -1,0 +1,125 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Template to deploy Config resources for the project.
+Parameters:
+  Project:
+    Type: String
+    Description: Name of the project for the Tag
+    Default: "mbdde"
+  Student:
+    Description: Student owner
+    Type: String
+    Default: "dgv"
+    AllowedValues:
+      - "dgv"
+  Prefix:
+    Type: String
+    Default: "tfm"
+    Description: Platform id prefix
+    AllowedValues:
+      - "tfm"
+
+Resources:
+
+  ConfigKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "KMS key for ${Prefix}-${Student}-${Project} Config Bucket"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: KeyPolicy
+        Statement:
+          - Sid: KeyAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: KeyWrite
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+            Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Owner
+          Value: !Ref Student
+
+  ConfigKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${Prefix}-${Student}-${Project}-config-kms-key"
+      TargetKeyId: !Ref ConfigKmsKey
+
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'config-${Prefix}-${Student}-${Project}-bucket'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt ConfigKmsKey.Arn
+            BucketKeyEnabled: true
+
+  DataLakeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - s3:ListBucket
+            Resource: !GetAtt ConfigBucket.Arn
+          - Sid: AllowRootAccountObjectAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:PutObjectAcl
+              - s3:GetObjectAcl
+            Resource: 
+              - !GetAtt ConfigBucket.Arn
+              - !Join [ '', [ !GetAtt ConfigBucket.Arn, '/*' ] ]
+
+Outputs:
+  ConfigBucketName:
+    Description: Config Bucket Name
+    Value: !Ref ConfigBucket
+    Export:
+      Name: !Sub "${Prefix}-${Student}-${Project}-config-bucket-name"
+
+  ConfigBucketArn:
+    Description: ARN Config Bucket
+    Value: !GetAtt ConfigBucket.Arn
+    Export:
+      Name: !Sub "${Prefix}-${Student}-${Project}-config-bucket-arn"
+
+  ConfigKmsKeyArn:
+    Description: ARN Config KMS Key
+    Value: !GetAtt ConfigKmsKey.Arn
+    Export:
+      Name: !Sub "${Prefix}-${Student}-${Project}-config-kms-key-arn"
+
+  ConfigKmsAliasName:
+    Description: Config KMS Key Alias Name
+    Value: !Ref ConfigKmsAlias
+    Export:
+      Name: !Sub "${Prefix}-${Student}-${Project}-config-kms--key-alias"

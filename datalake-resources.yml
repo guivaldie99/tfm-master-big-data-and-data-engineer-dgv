@@ -1,0 +1,260 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Template to deploy DataLake resources for the project.
+
+Parameters:
+  Project:
+    Type: String
+    Description: Name of the project for the Tag
+    Default: "mbdde"
+  Environment:
+    Type: String
+    Description: Name of the environment for the Tag
+    Default: "dev"
+    AllowedValues:
+      - "dev"
+      - "pre"
+      - "qa"
+      - "stg"
+      - "demo"
+      - "ocu"
+      - "prod"
+  Student:
+    Description: Student owner
+    Type: String
+    Default: "dgv"
+    AllowedValues:
+      - "dgv"
+  Prefix:
+    Type: String
+    Default: "tfm"
+    Description: Platform id prefix
+    AllowedValues:
+      - "tfm"
+  TfmMaxBytesScan:
+    Description: Athena Max Bytes Scan
+    Type: String
+    Default: "10737418240"
+
+Resources:
+
+  DataLakeKmsKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub "KMS key for ${Prefix}-${Student}-${Project} DataLake in ${Environment} environment"
+      EnableKeyRotation: true
+      KeyPolicy:
+        Version: "2012-10-17"
+        Id: KeyPolicy
+        Statement:
+          - Sid: KeyAdministration
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action: "kms:*"
+            Resource: "*"
+          - Sid: KeyWrite
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action:
+              - kms:GenerateDataKey
+              - kms:Decrypt
+              - kms:DescribeKey
+              - kms:Encrypt
+            Resource: "*"
+      Tags:
+        - Key: Project
+          Value: !Ref Project
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Owner
+          Value: !Ref Student
+
+  DataLakeKmsAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub "alias/${Prefix}-${Student}-${Project}-${Environment}-dl-kms-key"
+      TargetKeyId: !Ref DataLakeKmsKey
+
+  DataLakeBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-bucket'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt DataLakeKmsKey.Arn
+            BucketKeyEnabled: true
+      VersioningConfiguration:
+        Status: Enabled
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:Put
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: raw/
+            Function: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:dl-${Prefix}-${Student}-${Project}-${Environment}-to-bronze-lambda'
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: bronze/emt/arrivals/
+            Function: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:dl-${Prefix}-${Student}-${Project}-${Environment}-execute-arrivals-emr-notebook-lambda'
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: bronze/emt/lines/
+            Function: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:dl-${Prefix}-${Student}-${Project}-${Environment}-execute-lines-emr-notebook-lambda'
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: bronze/meteorology/
+            Function: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:dl-${Prefix}-${Student}-${Project}-${Environment}-execute-meteorology-emr-notebook-lambda'
+
+  DataLakeBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref DataLakeBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowRootAccountAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - s3:ListBucket
+            Resource: !GetAtt DataLakeBucket.Arn
+          - Sid: AllowRootAccountObjectAccess
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:PutObjectAcl
+              - s3:GetObjectAcl
+            Resource:
+              - !GetAtt DataLakeBucket.Arn
+              - !Join [ '', [ !GetAtt DataLakeBucket.Arn, '/*' ] ]
+
+  MeteorologySilverDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub ${Prefix}_${Student}_${Project}_meteorology_silver
+        Description: "bbdd for meteorology silver data"
+        LocationUri: !Join
+            - ''
+            - - "s3://"
+              - !Ref DataLakeBucket
+              - "/silver/"
+              - !Sub ${Prefix}_${Student}_${Project}_meteorology_silver
+
+  EMTSilverDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub ${Prefix}_${Student}_${Project}_emt_silver
+        Description: "bbdd for meteorology data"
+        LocationUri: !Join
+            - ''
+            - - "s3://"
+              - !Ref DataLakeBucket
+              - "/silver/"
+              - !Sub ${Prefix}_${Student}_${Project}_emt_silver
+
+  TFMGoldDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Sub ${Prefix}_${Student}_${Project}_gold
+        Description: "bbdd for gold layer data"
+        LocationUri: !Join
+            - ''
+            - - "s3://"
+              - !Ref DataLakeBucket
+              - "/gold/"
+              - !Sub ${Prefix}_${Student}_${Project}_gold
+
+  AthenaBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-athena-query-results-bucket'
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: aws:kms
+              KMSMasterKeyID: !GetAtt DataLakeKmsKey.Arn
+            BucketKeyEnabled: true
+
+  TFMWorkgroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Description: 'Athena workgroup for TFM workspace'
+      Name: !Sub 'dl-${Prefix}-${Student}-${Project}-${Environment}-athena-query-results-bucket'
+      State: 'ENABLED'
+      WorkGroupConfiguration:
+        BytesScannedCutoffPerQuery: !Ref TfmMaxBytesScan
+        EnforceWorkGroupConfiguration: 'true'
+        PublishCloudWatchMetricsEnabled: true
+        ResultConfiguration:
+          OutputLocation: !Sub 's3://dl-${Prefix}-${Student}-${Project}-${Environment}-athena-query-results-bucket/tfm/'
+      Tags:
+        - Key: "Workspace"
+          Value: tfm
+
+Outputs:
+  DataLakeBucketName:
+    Description: DataLake Bucket Name
+    Value: !Ref DataLakeBucket
+    Export:
+      Name: !Sub "${Project}-${Environment}-datalake-bucket-name"
+
+  DataLakeBucketArn:
+    Description: ARN Datalake Bucket
+    Value: !GetAtt DataLakeBucket.Arn
+    Export:
+      Name: !Sub "${Project}-${Environment}-datalake-bucket-arn"
+
+  DataLakeKmsKeyArn:
+    Description: ARN Datalake KMS Key
+    Value: !GetAtt DataLakeKmsKey.Arn
+    Export:
+      Name: !Sub "${Project}-${Environment}-datalake-kms-key-arn"
+
+  DataLakeKmsAliasName:
+    Description: Datalake KMS Key Alias Name
+    Value: !Ref DataLakeKmsAlias
+    Export:
+      Name: !Sub "${Project}-${Environment}-datalake-kms-key-alias"
+
+  AthenaBucketName:
+    Description: Athena Bucket Name
+    Value: !Ref AthenaBucket
+    Export:
+      Name: !Sub "${Project}-${Environment}-athena-bucket-name"
+
+  AthenaBucketArn:
+    Description: ARN Datalake Bucket
+    Value: !GetAtt AthenaBucket.Arn
+    Export:
+      Name: !Sub "${Project}-${Environment}-athena-bucket-arn"
+
